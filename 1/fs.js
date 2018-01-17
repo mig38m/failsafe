@@ -5,7 +5,7 @@ assert = require("assert");
 fs = require("fs")
 http = require("http");
 os = require('os')
-ws = require("uws")
+ws = require("ws")
 opn = require('./lib/opn')
 
 //crypto
@@ -63,7 +63,16 @@ kmac = (key, msg)=>keccak('keccak256').update(key).update(bin(msg)).digest()
 
 ts = () => Math.round(new Date/1000)
 
-
+parse = (json)=>{
+  try{
+    var o = JSON.parse(json)
+    if (o && typeof o === "object") {
+      return o
+    }
+  }catch(e){
+    return {}
+  }
+}
 
 
 concat = function() {
@@ -74,7 +83,7 @@ concat = function() {
 
 
 // used to authenticate browser sessions to this daemon
-const auth_code = toHex(crypto.randomBytes(32))
+auth_code = toHex(crypto.randomBytes(32))
 process.title = 'Failsafe'
 
 usage = ()=>{
@@ -149,10 +158,14 @@ allowedOnchain = [
   'voteDeny',
 ]
 
+// onchain Key value
 K = false
+// Private Key value
+PK = {}
 
 loadJSON = ()=>{
   if(fs.existsSync('data/k.json')){
+    l("Loading K")
     var json = fs.readFileSync('data/k.json')
     K = JSON.parse(json)
 
@@ -162,8 +175,6 @@ loadJSON = ()=>{
     me.members.map(f=>{
       f.block_pubkey = Buffer.from(f.block_pubkey,'hex')
     })
-
-    
   }
 }
 
@@ -206,6 +217,9 @@ cache = async (i)=>{
   if(K){ // already initialized
     cached_result.is_hub = me.is_hub
 
+    cached_result.my_member = !!me.my_member
+
+
     cached_result.K = K
 
     if(me.is_hub){
@@ -240,14 +254,15 @@ cache = async (i)=>{
       }
 
       var out_hash = out.split(' ')[0]
-      var host = me.my_member.location.split(':')[0]
-      var out_location = 'http://'+host+':'+base_port+'/'+filename
-      cached_result.install_snippet = `id=${base_port+1}
+
+      var our_location = me.my_member.location == 'ws://0.0.0.0:8000' ? `http://0.0.0.0:8000/` : `https://failsafe.network/`
+
+      cached_result.install_snippet = `id=fs
 f=${filename}
-mkdir $id && cd $id && curl http://${host}:${base_port}/$f -o $f
+mkdir $id && cd $id && curl ${our_location}$f -o $f
 
 if [[ -x /usr/bin/sha256sum ]] && sha256sum $f || shasum -a 256 $f | grep ${out_hash}; then
-  tar -xzf $f && rm $f && ./install && node fs.js ${base_port+1}
+  tar -xzf $f && rm $f && ./install && node fs.js 8001
 fi`
 
     })
@@ -258,14 +273,37 @@ fi`
 
 
 
+react = async (result={}, id=1)=>{
+  await cache()
+
+  if(me.id){
+    result.record = await me.byKey()
+
+    result.username = me.username // just for welcome message
+
+    result.pubkey = toHex(me.id.publicKey)
+    
+
+    if(!me.is_hub) result.ch = await me.channel(1)
+
+  }  
+
+  if(me.browser){
+    me.browser.send(JSON.stringify({
+      result: Object.assign(result, cached_result),
+      id: id
+    }))
+  }
+}
+
 me = false
+invoices = {}
 
 initDashboard=async a=>{
   var finalhandler = require('finalhandler');
   var serveStatic = require('serve-static');
 
-  // this serves dashboard HTML page
-  var server = http.createServer(function(req, res) {
+  var cb = function(req, res) {
     if(req.url.match(/^\/Failsafe-([0-9]+)\.tar\.gz$/)){
       var file = 'private'+req.url
       var stat = fs.statSync(file);
@@ -282,239 +320,93 @@ initDashboard=async a=>{
      res.on("drain", function () {
         fReadStream.resume();
      });
-   }else{
+    }else if(req.url=='/invoice'){
+      var queryData = ''
+      req.on('data', function(data) { queryData += data })
+
+      req.on('end', function() {
+        queryData = parse(queryData)
+
+        if(queryData.id){
+          var result = invoices[queryData.id]
+
+        }else{
+          var id = toHex(crypto.randomBytes(32)) 
+
+          invoices[id] = {
+            amount: parseInt(queryData.amount),
+            assetType: parseInt(queryData.assetType),
+            status: 'pending'
+          }
+
+          var result = {
+            invoice: id,
+            recipient: toHex(me.id.publicKey),
+            hubId: 1,
+            amount: invoices[id].amount,
+            status: 'pending'
+          }
+        }
+
+        res.end(JSON.stringify(result))
+      })
 
 
-    serveStatic("./wallet")(req, res, finalhandler(req, res));
-   }
+    }else{
+      serveStatic("./wallet")(req, res, finalhandler(req, res));
+    }
+  }
 
 
-  });
+  // this serves dashboard HTML page
+
+  var on_server = fs.existsSync('/etc/letsencrypt/live/failsafe.network/fullchain.pem')
+
+  if(on_server){
+    cert = {
+      cert: fs.readFileSync('/etc/letsencrypt/live/failsafe.network/fullchain.pem'),
+      key: fs.readFileSync('/etc/letsencrypt/live/failsafe.network/privkey.pem')
+    }
+    var server = require('https').createServer(cert, cb)
+    base_port = 443
+  }else{
+    cert = false
+    var server = require('http').createServer(cb)
+  }
 
   l('Set up HTTP server at '+base_port)
-
   server.listen(base_port).on('error', l)
 
   var url = 'http://0.0.0.0:'+base_port+'/#auth_code='+auth_code
-  l("Open "+url+" in your browser to get started")
-  opn(url)
+  l("Open "+url+" in your browser")
+
+
+  // only in desktop
+  if(base_port != 443) opn(url)
 
 
   me = new Me
   loadJSON()
 
+
+  setTimeout(async ()=>{
+    //auto login
+    if(fs.existsSync('private/pk.json')){
+      PK = JSON.parse(fs.readFileSync('private/pk.json'))
+      l('auto login')
+
+      await me.init(PK.username, Buffer.from(PK.seed, 'hex'))
+      await me.start()
+    }
+  }, 200)
+
   
-  wss = new ws.Server({ server: server, maxPayload:  64*1024*1024 });
-  
-  wss.users = {}
-
-  wss.on('error',function(err){ console.error(err)})
-
-  wss.on('connection', function(ws) {
-    ws.on('message', async msg=>{
-       // uws requires explicit conversion
-      if(msg[0] != '{'){ //{
-        me.processInput(ws, msg)
-      
-      }else{
-        msg = bin(msg).toString()
-
-        var result = {}
-
-        var json = JSON.parse(msg)
-        var p = json.params
-
-        // prevents all kinds of CSRF and DNS rebinding
-        // strong coupling between the console and the browser client
-          
-
-        if(json.auth_code == auth_code){
-          me.browser = ws
-
-          switch(json.method){
-            case 'sync':
-              result.confirm = "Syncing the chain..."
-              sync()
-
-              break
-            case 'load':
-              if(p.username){
-                var seed = await derive(p.username, p.pw)
-                me.init(p.username, seed)
-
-                await me.start()
-                await cache()
-
-                result.confirm = "Welcome!"                
-              }
-
-              break
-            case 'logout':         
-              me.id = false
-              me.intervals.map(clearInterval)
-              result.pubkey = false
-
-              break
-
-            case 'takeEverything':
-
-              var ch = await me.channel(1)
-              // post last available signed delta
-              await me.broadcast('settleUser', r([ 0, [ch.delta_record.sig ? ch.delta_record.sig : 1], [] ]) )
-              result.confirm = "Started a dispute onchain. Please wait a delay period to get your money back."
-              break
-
-            case 'send':
-
-              var hubId = 1
-
-              var amount = parseInt(parseFloat(p.off_amount)*100)
-
-              if(p.off_to.length == 64){
-                var mediate_to = Buffer.from(p.off_to, 'hex')
-              }else{
-                var mediate_to = await User.findById(parseInt(p.off_to))
-                if(mediate_to){
-                  mediate_to = mediate_to.pubkey
-                }else{
-                  result.alert = "This user ID is not found"
-                  break
-                }
-              }
-
-              var [status, error] = await me.payChannel(hubId, amount, mediate_to)
-              if(error){
-                result.alert = error
-              }else{
-                result.confirm = `Sent \$${p.off_amount} to ${p.off_to}!`
-              }
-
-
-            break
-
-            case 'settleUser':
-
-              //settle fsd ins outs
-
-              // contacting hubs and collecting instant withdrawals ins
-
-              var outs = []
-              for(o of p.outs){
-                // split by @
-                if(o.to.length > 0){
-                  var to = o.to.split('@')
-
-                  var hubId = to[1] ? parseInt(to[1]) : 0
-
-                  if(to[0].length == 64){
-                    var userId = Buffer.from(to[0], 'hex')
-
-                    // maybe this pubkey is already registred?
-                    var u = await User.findOne({where: {
-                      pubkey: userId
-                    }})
-
-                    if(u){
-                      userId = u.id
-                    }
-
-                  }else{
-                    var userId = parseInt(to[0])
-
-                    var u = await User.findById(userId)
-
-                    if(!u){
-                      result.alert = "User with short ID "+userId+" doesn't exist."
-                    }
-                  }
-
-                  if(o.amount.indexOf('.')==-1) o.amount+='.00'
-
-                  var amount = parseInt(o.amount.replace(/[^0-9]/g, ''))
-
-                  if(amount > 0){
-                    outs.push([userId, hubId, amount])
-                  }
-                }
-
-              }
-
-              if(!result.alert){
-                var encoded = r([0, p.ins, outs])
-                
-                result.confirm = await me.broadcast('settleUser', encoded)
-              }
-
-              break
-            case 'faucet':
-              me.sendMember('faucet', bin(me.id.publicKey), 0)
-              result.confirm = "Faucet triggered. Check your wallet!"
-
-              break
-            case 'pay':
-              if(json.confirmed){
-                originAllowence[json.proxyOrigin] -= json.params.amount
-                await me.payChannel(1, parseInt(json.params.amount), Buffer.from(json.params.recipient, 'hex'))
-                result = 'paid'
-              }else{
-                // request explicit confirmation
-                json.confirmation = true
-                ws.send(JSON.stringify(json))
-              }
-              break
-
-
-            case 'propose':
-              result.confirm = await me.broadcast('propose', p)
-              
-
-            break
-
-
-            case 'vote':
-              result.confirm = await me.broadcast(p.approve ? 'voteApprove' : 'voteDeny', r([p.id, p.rationale]) ) 
-
-            break
-
-
-            // Extra features: Failsafe Login
-            case 'login':
-              result.token = toHex(nacl.sign(json.proxyOrigin, me.id.secretKey))
-            break
-
-          }
-
-          if(me.id){
-            result.record = await me.byKey()
-
-            result.username = me.username // just for welcome message
-
-            result.pubkey = toHex(me.id.publicKey)
-            
-
-            if(!me.is_hub) result.ch = await me.channel(1)
-
-          }
-        }
-
-        Object.assign(result, cached_result)
-
-        ws.send(JSON.stringify({
-          result: result,
-          id: json.id
-        }))
-
-
-      }
-
-    })
-
-
-  });
-
-
-
-
+  localwss = new ws.Server({ server: server, maxPayload:  64*1024*1024 });
+    
+  localwss.on('error',function(err){ console.error(err)})
+  localwss.on('connection', function(ws) {
+    ws.on('message', (msg)=>{ require('./lib/rpc')(ws, msg) })
+  })
 
 }
 
@@ -530,7 +422,9 @@ derive = async (username, pw)=>{
         encoding: 'binary'
     }, (r)=>{
       r = bin(r)
-      l(`Derived ${r.toString('hex')} for ${username}:${pw}`)
+
+      //l(`Derived ${r.toString('hex')} for ${username}:${pw}`)
+
       resolve(r)
     });
 
@@ -596,8 +490,11 @@ Collateral = sequelize.define('collateral', {
 
   assetType: Sequelize.INTEGER,
 
-  delayed: Sequelize.INTEGER
-  // dispute has last nonce, last agreed_balance
+
+  delayed: Sequelize.INTEGER,
+  dispute_is_hub: Sequelize.BOOLEAN, // was it started by hub or user?
+  dispute_delta: Sequelize.INTEGER
+
 })
 
 
@@ -718,6 +615,12 @@ if(process.argv[2] == 'console'){
 
 }else if(process.argv[2] == 'genesis'){
   require('./lib/genesis')({location: process.argv[3]})
+}else if(process.argv[2] == 'login'){
+  setTimeout(async ()=>{
+    var me = new Me
+    var seed = await derive(process.argv[3], process.argv[4])
+    await me.init(process.argv[3], seed)
+  }, 100)
 }else{
 
   privSequelize.sync({force: false})
@@ -734,7 +637,7 @@ if(process.argv[2] == 'console'){
   }
 
   if (cluster.isWorker) {*/
-    initDashboard()
+  initDashboard()
   //}
 }
 

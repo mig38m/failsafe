@@ -1,17 +1,16 @@
 cd 1
-rm -rf private/db* private/Failsafe-* data ../8001 ../8002 ../8003 ../8004 ../8005
+rm -rf private/* data ../8001 ../8002 ../8003 ../8004 ../8005
 mkdir data
 mkdir private
 
-node fs genesis 0.0.0.0:8000
+node fs genesis ws://0.0.0.0:7999
 
 cd ..
 
-cp -r 1 8001
-cp -r 1 8002
-cp -r 1 8003
-cp -r 1 8004
+rsync -rv --exclude=private/pk.json 1/ 8001
+rsync -rv --exclude=private/pk.json 1/ 8002
+
 
 ttab "cd 8001; node fs 8001"
 ttab "cd 8002; node fs 8002"
-cd 1; node fs 8000
+ttab "cd 1; node fs 8000"

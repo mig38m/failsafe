@@ -16,11 +16,15 @@ class Me {
     this.status = 'await'
 
     this.sockets = {}
+    this.users = {}
     this.intervals = []
 
     this.block_keypair = nacl.sign.keyPair.fromSeed(kmac(this.seed, 'block'))
     this.block_pubkey = bin(this.block_keypair.publicKey).toString('hex')
 
+    PK.username = username
+    PK.seed = seed.toString('hex')
+    fs.writeFileSync('private/pk.json', JSON.stringify(PK))
   }
 
   async byKey(pk){
@@ -179,6 +183,8 @@ class Me {
   }
 
   async start(){
+    await cache()
+
     // in json pubkeys are in hex
     this.record = await this.byKey()
 
@@ -193,6 +199,23 @@ class Me {
     me.intervals.push(setInterval(cache, 1000))
 
     if(this.my_member){
+      // there's 2nd dedicated websocket server for member/hub commands
+      var cb = ()=>{}
+      var member_server = cert ? require('https').createServer(cert, cb) : require('http').createServer(cb)
+      member_server.listen(parseInt(this.my_member.location.split(':')[2]))
+
+
+      me.wss = new ws.Server({ 
+        server: member_server, 
+        maxPayload:  64*1024*1024 
+      });
+
+      me.users = {}
+      
+      me.wss.on('error',function(err){ console.error(err)})
+      me.wss.on('connection', function(ws) {
+        ws.on('message', (msg)=>{ me.processInput(ws, msg) })
+      })
 
       me.intervals.push(setInterval(require('./member'), 2000))
 
@@ -212,7 +235,7 @@ class Me {
             await this.broadcast('settle', r([0, h.ins, h.outs]))
           }
           
-        }, K.blocktime*2000))
+        }, K.blocktime*1000))
       }
     }else{
       // keep connection to hub open
@@ -254,7 +277,7 @@ class Me {
       let obj = me.offchainVerify(tx)
       l('Someone connected: '+toHex(obj.signer))
 
-      wss.users[obj.signer] = ws
+      me.users[obj.signer] = ws
 
       if(me.is_hub){ 
         // offline delivery if missed
@@ -270,7 +293,7 @@ class Me {
           var tx = concat(inputMap('mediate'), r([
             bin(me.id.publicKey), bin(sig), body, 0
           ]))
-          wss.users[obj.signer].send(tx)
+          me.users[obj.signer].send(tx)
         }
       }
 
@@ -365,11 +388,11 @@ class Me {
 
         ws.send(concat(inputMap('chain'), r(blockmap)))
       }else{
-        l("Wrong chain?")
+        l("Wrong chain? Can't find "+tx.toString('hex'))
       }
 
     }else if (inputType == 'mediate'){
-      var [pubkey, sig, body, mediate_to] = r(tx)
+      var [pubkey, sig, body, mediate_to, invoice] = r(tx)
 
       if(ec.verify(body, sig, pubkey)){
 
@@ -404,7 +427,7 @@ class Me {
           var fee = Math.round(amount * K.hub_fee)
           if(fee == 0) fee = K.hub_fee_base
 
-          await me.payChannel(mediate_to, amount - fee)
+          await me.payChannel(mediate_to, amount - fee, false, invoice)
 
         }else{
           // is it for us?
@@ -428,13 +451,19 @@ class Me {
           ch.delta_record.nonce++
           assert(nonce >= ch.delta_record.nonce)
 
+
+          l(invoices)
+          if(invoices[toHex(invoice)]){
+            invoices[toHex(invoice)].status = 'paid'
+          }
+
           ch.delta_record.delta = delta
           ch.delta_record.sig = r([pubkey, sig, body]) //raw delta
 
           await ch.delta_record.save()
           var ch = await me.channel(1)
 
-          History.create({
+          await History.create({
             userId: me.pubkey,
             hubId: hub.id,
             desc: "Received",
@@ -443,13 +472,7 @@ class Me {
             balance: ch.total + amount
           })
 
-          if(me.browser){
-            me.browser.send(JSON.stringify({
-              result: {ch: ch},
-              id: 1
-            }))
-          }
-          
+          react()
 
         }
 
@@ -474,7 +497,7 @@ class Me {
 
 
 
-  async payChannel(who, amount, mediate_to){
+  async payChannel(who, amount, mediate_to, invoice){
     l(`payChannel ${amount} to ${who}`)
 
     var ch = await me.channel(who)
@@ -491,11 +514,11 @@ class Me {
 
       var sig = ec(body, me.id.secretKey)
       var tx = concat(inputMap('mediate'), r([
-        bin(me.id.publicKey), bin(sig), body, 0
+        bin(me.id.publicKey), bin(sig), body, 0, invoice
       ]))
 
-      if(wss.users[who]){
-        wss.users[who].send(tx)
+      if(me.users[who]){
+        me.users[who].send(tx)
       }else{
         l(`not online, deliver later? ${tx}`)
       }
@@ -518,7 +541,7 @@ class Me {
 
       var sig = ec(body, me.id.secretKey)
 
-      me.sendMember('mediate', r([bin(me.id.publicKey), bin(sig), body, mediate_to]), 0)
+      me.sendMember('mediate', r([bin(me.id.publicKey), bin(sig), body, mediate_to, invoice]), 0)
       // todo: ensure delivery
   
       await ch.delta_record.save()
@@ -721,6 +744,41 @@ class Me {
     }
 
     // executing proposals that are due
+    let disputes = await Collateral.findAll({
+      where: {delayed: K.usable_blocks},
+      include: {all: true}
+    })
+
+    for(let dispute of disputes){
+      l(dispute)
+
+
+
+      var settled_delta = dispute.settled + dispute.dispute_delta
+
+      if(settled_delta < 0){
+        var user_gets = dispute.collateral + settled_delta
+        var hub_gets = dispute.collateral - user_gets
+      }else{
+        var user_gets = dispute.collateral
+        var hub_gets = 0
+      }
+
+      var user = await User.findById(dispute.userId)
+      var hub = await User.findById(dispute.hubId)
+
+      user.balance += user_gets
+      hub.balance += hub_gets
+      dispute.collateral = 0
+      dispute.delayed = null
+
+      await user.save()
+      await hub.save()
+      await dispute.save()
+    }
+
+
+    // executing proposals that are due
     let jobs = await Proposal.findAll({
       where: {delayed: K.usable_blocks},
       include: {all: true}
@@ -730,7 +788,7 @@ class Me {
       var total_shares = 0
       for(let v of job.voters){
         var voter = K.members.find(m=>m.id==v.id)
-        if(v.vote.approval){
+        if(v.vote.approval && voter){
           total_shares += voter.shares
         }else{
 
@@ -824,7 +882,7 @@ class Me {
         m.socket.send(tx)
       }
 
-      m.socket.open('ws://'+m.location)
+      m.socket.open(m.location)
     }
 
 
