@@ -454,6 +454,7 @@ class Me {
 
           l(invoices)
           if(invoices[toHex(invoice)]){
+            l("Paid invoice!")
             invoices[toHex(invoice)].status = 'paid'
           }
 

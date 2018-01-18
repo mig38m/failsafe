@@ -13,7 +13,7 @@ window.addEventListener('message',function(e){
 
   // special clause for 1click payments
   if(e.data.method == 'pay'){
-    var msg = "Pay $"+(json.amount/100)+" to "+json.recipient+"?"
+    var msg = "Send $"+(json.amount/100)+"?"
     var confirm_start = new Date
     if(!confirm(msg)) return false
     // was it authorized click?

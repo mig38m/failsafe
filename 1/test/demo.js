@@ -1,16 +1,49 @@
 axios = require('axios')
 l = console.log
+crypto = require('crypto')
+rand = ()=>crypto.randomBytes(32).toString('hex')
+
+Cookies = require('cookies')
+
+users = {}
+
+commy = (b,dot=true)=>{
+  let prefix = b < 0 ? '-' : ''
+
+  b = Math.abs(b).toString()
+  if(dot){
+    if(b.length==1){
+      b='0.0'+b
+    }else if(b.length==2){
+      b='0.'+b
+    }else{
+      var insert_dot_at = b.length - 2
+      b = b.slice(0,insert_dot_at) + '.' + b.slice(insert_dot_at)
+    }
+  }
+  return prefix + b.replace(/\B(?=(\d{3})+(?!\d))/g, ",")
+}
 
 require('http').createServer((req,res)=>{
 
+  cookies = new Cookies(req,res)
   
   res.status = 200
 
+  var id = cookies.get('id') 
+
   if(req.url == '/'){
+    if(!id){
+      id = rand()
+      cookies.set('id', id)
+    }
+    if(!users[id]) users[id] = 0
+
     res.end(`
     <h1>Failsafe Demo</h1>
 
-    <p>You are </p>
+    <p>Hello, ${id}</p>
+    <p>Balance: \$${commy(users[id])}</p>
 
     <html><body>
     <script src="https://unpkg.com/axios/dist/axios.min.js"></script>
@@ -70,15 +103,25 @@ window.addEventListener('message', function(e){
 window.onload = function(){
   donat.onclick = function(){
     axios.post('/init', {
-      amount: parseInt(amount.value)
+      amount: parseFloat(amount.value)*100
     }).then(r=>{
       console.log(r)
       FS('pay', r.data).then(data=>{
         if(data.status == 'paid'){
-          donat.style['background-color'] = 'gold'
+          // server can receive it later
           setTimeout(()=>{
-            donat.style['background-color'] = ''
-          },2000)
+
+
+            axios.post('/init', {
+              invoice: r.data.invoice
+            }).then((r2)=>{
+
+              console.log(r2.data)
+
+              location.reload()
+            })
+          }, 500)
+
         }
       })
  
@@ -88,8 +131,7 @@ window.onload = function(){
 </script>
 
 <div id="zone">
-  
-  <input id=amount placeholder="Amount">
+  <input id=amount placeholder="$ Amount">
   <button width="200px" id="donat">Deposit</button
 </div>
 
@@ -106,6 +148,18 @@ window.onload = function(){
       var p = JSON.parse(queryData)
 
       if(p.invoice){
+        l(p.invoice)
+        axios.post('http://0.0.0.0:8002/invoice', {
+          invoice: p.invoice
+        }).then(r=>{ 
+          l('got invoice', r)
+          if(r.data.status == 'paid'){
+            users[id] += r.data.amount
+          }else{
+            console.log('Expired')
+          }
+          res.end(JSON.stringify({status: 'paid'})) 
+        })
 
       }else{ 
         l(req.url)

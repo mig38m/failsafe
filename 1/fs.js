@@ -327,23 +327,27 @@ initDashboard=async a=>{
       req.on('end', function() {
         queryData = parse(queryData)
 
-        if(queryData.id){
-          var result = invoices[queryData.id]
-
+        if(queryData.invoice){
+          // deep clone
+          var result = Object.assign({}, invoices[queryData.invoice])
+          
+          // prevent race condition attack
+          if(invoices[queryData.invoice].status == 'paid')
+          invoices[queryData.invoice].status = 'archive'
         }else{
-          var id = toHex(crypto.randomBytes(32)) 
+          var invoice = toHex(crypto.randomBytes(32)) 
 
-          invoices[id] = {
+          invoices[invoice] = {
             amount: parseInt(queryData.amount),
             assetType: parseInt(queryData.assetType),
             status: 'pending'
           }
 
           var result = {
-            invoice: id,
+            invoice: invoice,
             recipient: toHex(me.id.publicKey),
             hubId: 1,
-            amount: invoices[id].amount,
+            amount: invoices[invoice].amount,
             status: 'pending'
           }
         }
