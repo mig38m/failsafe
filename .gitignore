@@ -5,6 +5,10 @@ npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 
+# Private
+1/private/*
+1/data/*
+
 # Runtime data
 pids
 *.pid
